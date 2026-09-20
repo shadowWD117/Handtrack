@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PNG Stretch Hand Tracking Filter</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+
+        body {
+            position: relative;
+            font-family: Arial, sans-serif;
+        }
+
+        #video {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scaleX(-1);
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+
+        #canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        #status {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            padding: 8px 14px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: bold;
+            z-index: 10;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+    </style>
+
+    <!-- Library MediaPipe Legacy -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+
+<body>
+
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="status">Menyiapkan Kamera... ⚡</div>
+
+    <script>
+        const video = document.getElementById("video");
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+        const status = document.getElementById("status");
+
+        let videoWidth = 0;
+        let videoHeight = 0;
+
+        /*
+        ============================================================
+        1. LOAD PNG CUSTOM KAMU DI SINI 🖼️✨
+        ============================================================
+        */
+        const customImg = new Image();
+        customImg.crossOrigin = "anonymous";
+        // Ganti URL di bawah dengan file PNG transparan kamu (bisa path lokal/URL)
+        customImg.src = "logo.png"; 
+
+        /*
+        ============================================================
+        2. CONFIG & STATE FILTER 🎨✨
+        ============================================================
+        */
+        const filters = [
+            { name: "Negatif (Secret Reveal) 🔮", type: "video", css: "invert(1)" },
+            { name: "Hitam Putih 🖤🤍", type: "video", css: "grayscale(1) contrast(1.3)" },
+            { name: "Cyberpunk Neon 👾", type: "video", css: "hue-rotate(180deg) saturate(2.5)" },
+            { name: "PNG Custom Stretch 🖼️🔥", type: "png" }
+        ];
+        let currentFilterIndex = 0;
+        let wasPinched = false;
+
+        const handData = [
+            { active: false, rawThumb: { x: 0, y: 0 }, rawIndex: { x: 0, y: 0 }, smoothThumb: { x: 0, y: 0 }, smoothIndex: { x: 0, y: 0 }, scale: 100, isPinching: false },
+            { active: false, rawThumb: { x: 0, y: 0 }, rawIndex: { x: 0, y: 0 }, smoothThumb: { x: 0, y: 0 }, smoothIndex: { x: 0, y: 0 }, scale: 100, isPinching: false }
+        ];
+
+        /*
+        ============================================================
+        3. CANVAS & HELPER 📐
+        ============================================================
+        */
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener("resize", resizeCanvas);
+        resizeCanvas();
+
+        function getVideoDisplayRect() {
+            const screenWidth = canvas.width;
+            const screenHeight = canvas.height;
+            const videoRatio = (videoWidth || 640) / (videoHeight || 480);
+            const screenRatio = screenWidth / screenHeight;
+
+            let width, height;
+            if (screenRatio > videoRatio) {
+                height = screenHeight;
+                width = height * videoRatio;
+            } else {
+                width = screenWidth;
+                height = width / videoRatio;
+            }
+
+            return {
+                x: (screenWidth - width) / 2,
+                y: (screenHeight - height) / 2,
+                width,
+                height
+            };
+        }
+
+        function landmarkToScreen(point) {
+            const rect = getVideoDisplayRect();
+            return {
+                x: rect.x + (1 - point.x) * rect.width,
+                y: rect.y + point.y * rect.height
+            };
+        }
+
+        function updateAdaptivePoint(smoothPt, rawPt) {
+            const dx = rawPt.x - smoothPt.x;
+            const dy = rawPt.y - smoothPt.y;
+            const dist = Math.hypot(dx, dy);
+
+            let factor = 0.25;
+            if (dist > 80) factor = 0.95;
+            else if (dist > 35) factor = 0.70;
+            else if (dist > 15) factor = 0.45;
+
+            smoothPt.x += dx * factor;
+            smoothPt.y += dy * factor;
+        }
+
+        /*
+        ============================================================
+        4. TRIANGLE MESH WARP ENGINE (BIAR PNG BISA STRETCH) 📐🎨
+        ============================================================
+        */
+        function drawTriangleImage(img, u0, v0, u1, v1, u2, v2, x0, y0, x1, y1, x2, y2) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(x0, y0);
+            ctx.lineTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.closePath();
+            ctx.clip();
+
+            const delta = u0 * (v1 - v2) - v0 * (u1 - u2) + (u1 * v2 - u2 * v1);
+            if (delta === 0) { ctx.restore(); return; }
+
+            const delta_a = x0 * (v1 - v2) - v0 * (x1 - x2) + (x1 * v2 - x2 * v1);
+            const delta_b = u0 * (x1 - x2) - x0 * (u1 - u2) + (u1 * x2 - u2 * x1);
+            const delta_c = u0 * (v1 * x2 - v2 * x1) - v0 * (u1 * x2 - u2 * x1) + x0 * (u1 * v2 - u2 * v1);
+
+            const delta_d = y0 * (v1 - v2) - v0 * (y1 - y2) + (y1 * v2 - y2 * v1);
+            const delta_e = u0 * (y1 - y2) - y0 * (u1 - u2) + (u1 * y2 - u2 * y1);
+            const delta_f = u0 * (v1 * y2 - v2 * y1) - v0 * (u1 * y2 - u2 * y1) + y0 * (u1 * v2 - u2 * v1);
+
+            ctx.transform(
+                delta_a / delta, delta_d / delta,
+                delta_b / delta, delta_e / delta,
+                delta_c / delta, delta_f / delta
+            );
+
+            ctx.drawImage(img, 0, 0);
+            ctx.restore();
+        }
+
+        function drawWarpedPNG(img, p0, p1, p2, p3) {
+            if (!img.complete || img.naturalWidth === 0) return;
+            const w = img.width;
+            const h = img.height;
+
+            // Potong PNG jadi 2 segitiga lalu transform melar menyesuaikan 4 titik jari
+            drawTriangleImage(img, 0, 0, w, 0, 0, h, p0.x, p0.y, p1.x, p1.y, p3.x, p3.y);
+            drawTriangleImage(img, w, 0, w, h, 0, h, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+        }
+
+        /*
+        ============================================================
+        5. DRAWING & RENDER FUNCTIONS 🎨
+        ============================================================
+        */
+        function drawPoint(point, isPinching) {
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, 7, 0, Math.PI * 2);
+            ctx.fillStyle = isPinching ? "#ff0055" : "#00ffff";
+            ctx.shadowColor = isPinching ? "#ff0055" : "#00ffff";
+            ctx.shadowBlur = 8;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        function drawLine(a, b) {
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.strokeStyle = "rgba(0, 255, 255, 0.85)";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        function drawFilteredFrame(leftTop, rightTop, rightBottom, leftBottom) {
+            const currentFilter = filters[currentFilterIndex];
+
+            if (currentFilter.type === "png") {
+                // RENDER FILTER KE-4: PNG STRETCH OVERLAY 🖼️
+                drawWarpedPNG(customImg, leftTop, rightTop, rightBottom, leftBottom);
+            } else {
+                // RENDER FILTER VIDEO CAMERA 🔮
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(leftTop.x, leftTop.y);
+                ctx.lineTo(rightTop.x, rightTop.y);
+                ctx.lineTo(rightBottom.x, rightBottom.y);
+                ctx.lineTo(leftBottom.x, leftBottom.y);
+                ctx.closePath();
+                ctx.clip();
+
+                ctx.filter = currentFilter.css;
+
+                const rect = getVideoDisplayRect();
+                ctx.save();
+                ctx.translate(rect.x + rect.width, rect.y);
+                ctx.scale(-1, 1);
+                ctx.drawImage(video, 0, 0, rect.width, rect.height);
+                ctx.restore();
+
+                // TEKS RAHASIA WARECODE (Khusus Filter Negatif)
+                if (currentFilter.name.includes("Negatif")) {
+                    ctx.filter = "none";
+                    ctx.fillStyle = "#ffffff";
+                    const fontSize = Math.max(32, Math.floor(canvas.width * 0.08));
+                    ctx.font = `900 ${fontSize}px Arial, sans-serif`;
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.shadowColor = "#00ffff";
+                    ctx.shadowBlur = 20;
+                    ctx.fillText("WARECODE", canvas.width / 2, canvas.height / 2);
+                    ctx.shadowBlur = 0;
+                }
+
+                ctx.restore();
+            }
+
+            // Bingkai Cyan Luar Polygon
+            ctx.beginPath();
+            ctx.moveTo(leftTop.x, leftTop.y);
+            ctx.lineTo(rightTop.x, rightTop.y);
+            ctx.lineTo(rightBottom.x, rightBottom.y);
+            ctx.lineTo(leftBottom.x, leftBottom.y);
+            ctx.closePath();
+            ctx.fillStyle = "rgba(0, 255, 255, 0.08)";
+            ctx.fill();
+            ctx.strokeStyle = "rgba(0, 255, 255, 0.9)";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        /*
+        ============================================================
+        6. RENDER LOOP 🔄
+        ============================================================
+        */
+        function renderLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const activeHands = [];
+            let anyHandPinching = false;
+
+            for (let i = 0; i < 2; i++) {
+                const h = handData[i];
+                if (h.active) {
+                    updateAdaptivePoint(h.smoothThumb, h.rawThumb);
+                    updateAdaptivePoint(h.smoothIndex, h.rawIndex);
+
+                    if (h.isPinching) anyHandPinching = true;
+
+                    activeHands.push(h);
+
+                    drawPoint(h.smoothThumb, h.isPinching);
+                    drawPoint(h.smoothIndex, h.isPinching);
+                    drawLine(h.smoothThumb, h.smoothIndex);
+                }
+            }
+
+            // Pinch ganti filter (Siklus 4 filter)
+            if (anyHandPinching && !wasPinched) {
+                currentFilterIndex = (currentFilterIndex + 1) % filters.length;
+                wasPinched = true;
+            } else if (!anyHandPinching) {
+                wasPinched = false;
+            }
+
+            // Update info status
+            if (activeHands.length > 0) {
+                status.textContent = `${activeHands.length} Tangan | Filter: ${filters[currentFilterIndex].name} ${anyHandPinching ? '👌' : ''}`;
+            } else {
+                status.textContent = "Arahkan tangan berdua ke kamera... 🖐️🖐️";
+            }
+
+            // Render Polygon Lensa
+            if (activeHands.length >= 2) {
+                let leftHand = activeHands[0];
+                let rightHand = activeHands[1];
+
+                if (leftHand.smoothIndex.x > rightHand.smoothIndex.x) {
+                    leftHand = activeHands[1];
+                    rightHand = activeHands[0];
+                }
+
+                drawLine(leftHand.smoothIndex, rightHand.smoothIndex);
+                drawLine(leftHand.smoothThumb, rightHand.smoothThumb);
+
+                drawFilteredFrame(
+                    leftHand.smoothIndex,
+                    rightHand.smoothIndex,
+                    rightHand.smoothThumb,
+                    leftHand.smoothThumb
+                );
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        /*
+        ============================================================
+        7. MEDIAPIPE AI SETUP & INIT ⚙️🎥
+        ============================================================
+        */
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 0,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+            const handsLandmarks = results.multiHandLandmarks;
+
+            if (!handsLandmarks || handsLandmarks.length === 0) {
+                handData[0].active = false;
+                handData[1].active = false;
+                return;
+            }
+
+            for (let i = 0; i < 2; i++) {
+                if (i < handsLandmarks.length) {
+                    const hand = handsLandmarks[i];
+                    const h = handData[i];
+
+                    h.active = true;
+                    h.rawThumb = landmarkToScreen(hand[4]);
+                    h.rawIndex = landmarkToScreen(hand[8]);
+
+                    const p0 = landmarkToScreen(hand[0]);
+                    const p9 = landmarkToScreen(hand[9]);
+                    h.scale = Math.hypot(p9.x - p0.x, p9.y - p0.y);
+
+                    const pinchDist = Math.hypot(h.rawThumb.x - h.rawIndex.x, h.rawThumb.y - h.rawIndex.y);
+                    h.isPinching = pinchDist < (h.scale * 0.28);
+
+                    if (!h.smoothThumb.x) {
+                        h.smoothThumb = { ...h.rawThumb };
+                        h.smoothIndex = { ...h.rawIndex };
+                    }
+                } else {
+                    handData[i].active = false;
+                }
+            }
+        });
+
+        async function init() {
+            try {
+                const camera = new Camera(video, {
+                    onFrame: async () => {
+                        await hands.send({ image: video });
+                    },
+                    width: 640,
+                    height: 480
+                });
+
+                await camera.start();
+
+                video.addEventListener("loadedmetadata", () => {
+                    videoWidth = video.videoWidth;
+                    videoHeight = video.videoHeight;
+                });
+
+                requestAnimationFrame(renderLoop);
+
+            } catch (error) {
+                console.error(error);
+                status.textContent = "Error Kamera: " + error.message;
+            }
+        }
+
+        init();
+    </script>
+</body>
+
+</html>
